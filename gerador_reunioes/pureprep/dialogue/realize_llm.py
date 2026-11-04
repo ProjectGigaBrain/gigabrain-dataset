@@ -8,11 +8,13 @@ Fluxo:
 2. a resposta (JSON ``{"turns": [{"id", "text"}]}``) fica em cache em disco,
    chaveada pelo hash do prompt + modelo — uma segunda execução reproduz a
    variante sem chamar o LLM (``offline=True`` exige cache completo);
-3. cada fala é **verificada** contra o plano (números preservados, nenhum
+3. se **todas** as janelas de um documento falham, a geração para (senão a
+   "variante B" sairia idêntica à A sem ninguém perceber);
+4. cada fala é **verificada** contra o plano (números preservados, nenhum
    valor inventado, detalhe removido não reaparece, conteúdo mínimo
    preservado, tamanho do ato); se falhar, o turno volta para o texto do
    realizador por regras e o motivo entra nas estatísticas;
-4. o ruído lexical é aplicado depois, igual ao da variante A
+5. o ruído lexical é aplicado depois, igual ao da variante A
    (:func:`realize_rules.assemble`), para que A e B difiram só na paráfrase.
 """
 
@@ -26,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ..textsim import containment, normalize_ws, token_set
-from .llm_providers import LLMUnavailable
+from .llm_providers import LLMFatal, LLMUnavailable
 from .model import VALID_ROLES
 from .realize_rules import assemble, render_turn
 
@@ -307,6 +309,12 @@ def realize(plan, rng, *, provider, cache_dir=None, offline=False, workers=8, wi
     jobs = build_windows(plan, window=window)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         texts = list(ex.map(lambda job: _fetch(provider, cache_dir, offline, job[1], stats), jobs))
+    if jobs and provider.name != "dry" and all(t is None for t in texts):
+        # sem nenhuma resposta a "variante B" sairia idêntica à A: melhor parar
+        # (o que já veio fica no cache e a próxima execução retoma dali)
+        reason = max((k for k in stats if k.startswith("request_failed:")), key=stats.get, default="?")
+        raise LLMFatal(f"Todas as {len(jobs)} requisições de '{plan.title}' falharam "
+                       f"({reason.removeprefix('request_failed:')}). Interrompendo para não gerar uma variante B igual à A.")
     llm = {}
     for (ids, _), text in zip(jobs, texts):
         got = _parse(text)

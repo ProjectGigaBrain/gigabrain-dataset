@@ -291,7 +291,7 @@ Desenho:
 - **Verificação por regras** de cada fala, no lugar do NLI/LLM-juiz previsto na tabela 5.1. São verificados: números preservados, nenhum número inventado, detalhe removido não reaparece, ≥ 50% dos tokens de conteúdo preservados, valor da variante preservado em distratores e reafirmações, e tamanho compatível com o ato. Fala reprovada volta para o texto da variante A, e os motivos ficam no gabarito (`generator.realizer_stats`). A verificação é mais fraca que um NLI: confere preservação lexical e numérica, não a equivalência semântica completa. Uma revisão humana por amostragem continua recomendada.
 - **Ruído lexical idêntico ao da A**, aplicado depois do LLM com a mesma semente. Um B sem nenhuma fala aceita reproduz a A byte a byte (teste `test_dry_run_falls_back_to_rules_everywhere`).
 - **Reprodutibilidade:** as respostas ficam em cache versionado (hash de versão do prompt, provedor, modelo e prompt), e `--llm-offline` regenera a variante sem chamar o LLM.
-- **Provedor configurável:** Anthropic (padrão `claude-opus-5-5`, esforço `low`) ou qualquer API compatível com OpenAI. Como a família do LLM do sistema avaliado ainda não está definida, a escolha fica para a geração; recomenda-se uma família diferente da do sistema.
+- **Provedor configurável:** Anthropic (padrão `claude-opus-5-5`, esforço `low`), LLM local via Ollama ou qualquer API compatível com OpenAI. Como a família do LLM do sistema avaliado ainda não está definida, a escolha fica para a geração; recomenda-se uma família diferente da do sistema.
 
 **Escala** (dry-run, 18 documentos, perfis `clean`, `realistic` e `hard`): 470 requisições, ~0,8 M tokens de entrada e ~0,35 M de saída, sem contar o raciocínio do modelo.
 

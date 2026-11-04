@@ -8,7 +8,7 @@ import pytest
 
 from pureprep.dialogue import build_meetings, profiles
 from pureprep.dialogue import realize_llm as RL
-from pureprep.dialogue.llm_providers import DryRunProvider, LLMUnavailable
+from pureprep.dialogue.llm_providers import DryRunProvider, LLMFatal, LLMUnavailable
 from pureprep.dialogue.model import Phenomenon, Turn, Utt
 from tests.test_meetings import _check_invariants, portal  # noqa: F401  (fixture)
 
@@ -155,14 +155,24 @@ def test_verify_short_acts_and_cleanup():
 
 
 def test_provider_failure_is_counted(portal, tmp_path):
+    class Flaky(EchoProvider):  # falha nas janelas que começam no turno 1 de cada reunião
+        def complete(self, system, user, schema):
+            if json.loads(user)["turns"][0]["id"].endswith(":T1"):
+                raise LLMUnavailable("HTTP 529: overloaded")
+            return super().complete(system, user, schema)
+    _, _, g = _run(portal, Flaky(), tmp_path)
+    st = g["_run_stats"]
+    assert 0 < st["request_failed:HTTP 529: overloaded"] < st["windows"]
+    assert not any(k.startswith("request_failed") for k in g["generator"]["realizer_stats"])
+    assert st["fallback:no_response"] > 0 and st["llm_accepted"] > 0
+
+
+def test_all_requests_failing_stops_instead_of_copying_a(portal, tmp_path):
     class Broken(EchoProvider):
         def complete(self, system, user, schema):
-            raise LLMUnavailable("HTTP 529: overloaded")
-    _, _, g = _run(portal, Broken(), tmp_path)
-    st = g["_run_stats"]
-    assert st["request_failed:HTTP 529: overloaded"] == st["windows"]
-    assert not any(k.startswith("request_failed") for k in g["generator"]["realizer_stats"])
-    assert st["fallback:no_response"] == st["turns"]
+            raise LLMUnavailable("conexão: recusada")
+    with pytest.raises(LLMFatal, match="conexão: recusada"):
+        _run(portal, Broken(), tmp_path)
 
 
 @pytest.fixture(autouse=True)
@@ -226,3 +236,171 @@ def test_fatal_api_error_stops_generation(fake_api, portal, tmp_path):
     fake_api["status"] = 400
     with pytest.raises(LLMFatal, match="HTTP 400"):
         _run(portal, AnthropicProvider(max_retries=0), tmp_path)
+
+
+# ----------------------------------------------------------------- provedores HTTP locais (ollama, openai)
+
+
+@pytest.fixture
+def local_server():
+    """Servidor HTTP local configurável: ``routes[(método, caminho)] = (status, corpo)``
+    ou uma função ``body -> (status, corpo)``. Guarda as requisições recebidas."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    state = {"routes": {}, "requests": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, method):
+            n = int(self.headers.get("content-length") or 0)
+            body = json.loads(self.rfile.read(n)) if n else None
+            state["requests"].append({"method": method, "path": self.path, "headers": dict(self.headers), "body": body})
+            route = state["routes"].get((method, self.path), (404, {"error": "not found"}))
+            status, resp = route(body) if callable(route) else route
+            data = json.dumps(resp).encode()
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            self._reply("GET")
+
+        def do_POST(self):
+            self._reply("POST")
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    state["url"] = f"http://127.0.0.1:{srv.server_port}"
+    yield state
+    srv.shutdown()
+
+
+def _free_port_url():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
+def _ollama(local_server, **kw):
+    from pureprep.dialogue.llm_providers import OllamaProvider
+    return OllamaProvider(kw.pop("model", "qwen3:14b"), base_url=local_server["url"] + "/v1", max_retries=0, **kw)
+
+
+def test_ollama_sends_schema_and_num_ctx_and_strips_thinking(local_server):
+    local_server["routes"][("POST", "/api/chat")] = (200, {
+        "message": {"role": "assistant", "content": '<think>hmm {x}</think>{"turns": []}'}, "done_reason": "stop"})
+    p = _ollama(local_server, num_ctx=12000)
+    assert p.complete(RL.SYSTEM, "{}", RL.SCHEMA) == '{"turns": []}'
+    req = local_server["requests"][-1]
+    assert req["path"] == "/api/chat"  # o /v1 do endereço compatível é descartado
+    assert req["body"]["format"] == RL.SCHEMA and req["body"]["stream"] is False
+    assert req["body"]["options"]["num_ctx"] == 12000
+    assert "authorization" not in {k.lower() for k in req["headers"]}
+    assert p.params() == {"provider": "ollama", "model": "qwen3:14b"}  # chave do cache não depende do endereço
+
+
+def test_ollama_check_reports_missing_model_and_server_down(local_server):
+    local_server["routes"][("GET", "/api/tags")] = (200, {"models": [{"name": "gemma3:12b"}, {"name": "llama3.1:latest"}]})
+    _ollama(local_server, model="gemma3:12b").check()
+    _ollama(local_server, model="llama3.1").check()  # sem tag = :latest
+    with pytest.raises(LLMFatal, match="ollama pull qwen3:14b"):
+        _ollama(local_server).check()
+    from pureprep.dialogue.llm_providers import OllamaProvider
+    with pytest.raises(LLMFatal, match="Ollama"):
+        OllamaProvider("qwen3:14b", base_url=_free_port_url()).check()
+
+
+def test_ollama_truncation_and_fatal_errors(local_server):
+    local_server["routes"][("POST", "/api/chat")] = (200, {"message": {"content": '{"turns": ['}, "done_reason": "length"})
+    with pytest.raises(LLMUnavailable, match="num-ctx"):
+        _ollama(local_server).complete(RL.SYSTEM, "{}", RL.SCHEMA)
+    local_server["routes"][("POST", "/api/chat")] = (404, {"error": "model 'qwen3:14b' not found"})
+    with pytest.raises(LLMFatal, match="not found"):
+        _ollama(local_server).complete(RL.SYSTEM, "{}", RL.SCHEMA)
+    local_server["routes"][("POST", "/api/chat")] = (500, {"error": "out of memory"})
+    with pytest.raises(LLMUnavailable, match="out of memory"):
+        _ollama(local_server).complete(RL.SYSTEM, "{}", RL.SCHEMA)
+
+
+def test_ollama_end_to_end_through_realizer(local_server, portal, tmp_path):
+    def chat(body):
+        reply = EchoProvider().complete(None, body["messages"][1]["content"], None)
+        return 200, {"message": {"content": reply}, "done_reason": "stop"}
+    local_server["routes"][("POST", "/api/chat")] = chat
+    _, realized, g = _run(portal, _ollama(local_server), tmp_path)
+    assert g["generator"]["realizer_stats"]["llm_accepted"] > 0.8 * g["generator"]["realizer_stats"]["turns"]
+    assert g["generator"]["params"]["llm"]["provider"] == "ollama"
+    assert (tmp_path / "cache" / "ollama-qwen3_14b").is_dir()
+
+
+def _openai(local_server, **kw):
+    from pureprep.dialogue.llm_providers import OpenAICompatibleProvider
+    return OpenAICompatibleProvider("local-model", base_url=local_server["url"] + "/v1", max_retries=0, **kw)
+
+
+def test_openai_compatible_works_without_sdk_or_key(local_server, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    local_server["routes"][("POST", "/v1/chat/completions")] = (200, {
+        "choices": [{"message": {"content": '{"turns": []}'}, "finish_reason": "stop"}]})
+    assert _openai(local_server).complete(RL.SYSTEM, "{}", RL.SCHEMA) == '{"turns": []}'
+    req = local_server["requests"][-1]
+    assert req["body"]["response_format"]["type"] == "json_schema"
+    assert req["body"]["response_format"]["json_schema"]["schema"] == RL.SCHEMA
+    assert "authorization" not in {k.lower() for k in req["headers"]}
+    _openai(local_server, api_key="sk-x").complete(RL.SYSTEM, "{}", RL.SCHEMA)
+    assert local_server["requests"][-1]["headers"]["Authorization"] == "Bearer sk-x"
+
+
+def test_openai_compatible_falls_back_to_json_object(local_server):
+    def chat(body):
+        if body["response_format"]["type"] == "json_schema":
+            return 400, {"error": {"message": "'response_format.type' must be 'json_object' or 'text'"}}
+        return 200, {"choices": [{"message": {"content": '{"turns": []}'}, "finish_reason": "stop"}]}
+    local_server["routes"][("POST", "/v1/chat/completions")] = chat
+    p = _openai(local_server)
+    assert p.complete(RL.SYSTEM, "{}", RL.SCHEMA) == '{"turns": []}'
+    p.complete(RL.SYSTEM, "{}", RL.SCHEMA)
+    types = [r["body"]["response_format"]["type"] for r in local_server["requests"]]
+    assert types == ["json_schema", "json_object", "json_object"]  # só tenta o esquema uma vez
+
+
+def test_openai_compatible_errors(local_server):
+    local_server["routes"][("POST", "/v1/chat/completions")] = (200, {
+        "choices": [{"message": {"content": '{"tu'}, "finish_reason": "length"}]})
+    with pytest.raises(LLMUnavailable, match="truncada"):
+        _openai(local_server).complete(RL.SYSTEM, "{}", RL.SCHEMA)
+    local_server["routes"][("POST", "/v1/chat/completions")] = (401, {"error": {"message": "invalid api key"}})
+    with pytest.raises(LLMFatal, match="invalid api key"):
+        _openai(local_server).complete(RL.SYSTEM, "{}", RL.SCHEMA)
+    from pureprep.dialogue.llm_providers import OpenAICompatibleProvider
+    with pytest.raises(LLMFatal, match="rodando"):
+        OpenAICompatibleProvider("m", base_url=_free_port_url() + "/v1").check()
+
+
+def test_transient_errors_are_retried(local_server):
+    from pureprep.dialogue.llm_providers import OllamaProvider
+    calls = []
+
+    def chat(body):
+        calls.append(1)
+        if len(calls) < 3:
+            return 503, {"error": "loading model"}
+        return 200, {"message": {"content": '{"turns": []}'}, "done_reason": "stop"}
+    local_server["routes"][("POST", "/api/chat")] = chat
+    p = OllamaProvider("qwen3:14b", base_url=local_server["url"], max_retries=3, retry_wait=0.01)
+    assert p.complete(RL.SYSTEM, "{}", RL.SCHEMA) == '{"turns": []}'
+    assert len(calls) == 3
+
+
+def test_cli_stops_before_generating_when_ollama_is_down(tmp_path):
+    from pureprep import cli
+    with pytest.raises(LLMFatal, match="Ollama"):
+        cli.main(["--realizer", "llm", "--llm-provider", "ollama", "--llm-model", "qwen3:14b",
+                  "--llm-base-url", _free_port_url(), "--out", str(tmp_path / "out")])
+    assert not (tmp_path / "out").exists()

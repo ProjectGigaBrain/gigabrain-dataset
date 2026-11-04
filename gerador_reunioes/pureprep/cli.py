@@ -25,9 +25,9 @@ from pathlib import Path
 
 from . import V1_VERSION, __version__, utf8_stdio
 from .dialogue import PROFILES, REALIZERS, build_meetings, meeting_file, variant_name
-from .dialogue.llm_providers import make_provider
+from .dialogue.llm_providers import PROVIDERS, make_provider
 from .extract import extract
-from .parse import load_document
+from .parse import load_document, slugify
 from .synth import build_context, build_dialogue, build_notes, sample_reqs, support
 
 MODES = ("context", "notes", "dialogue")  # modos v1 (um arquivo de entrada por par)
@@ -199,17 +199,21 @@ def main(argv=None):
     ap.add_argument("--realizer", default="rules", choices=sorted(REALIZERS),
                     help="realizador da superfície do texto no modo meetings")
     g = ap.add_argument_group("realizador llm (variante B)")
-    g.add_argument("--llm-provider", default="anthropic", choices=("anthropic", "openai", "dry"),
-                   help="dry = não chama LLM, só estima requisições e tokens")
-    g.add_argument("--llm-model", default=None, help="padrão: claude-opus-5-5 (anthropic); obrigatório com openai")
+    g.add_argument("--llm-provider", default="anthropic", choices=PROVIDERS,
+                   help="ollama = LLM local; openai = qualquer API compatível; dry = não chama LLM, só estima requisições e tokens")
+    g.add_argument("--llm-model", default=None, help="padrão: claude-opus-5-5 (anthropic); obrigatório com ollama e openai")
     g.add_argument("--llm-effort", default="low", choices=("low", "medium", "high", "xhigh", "max"), help="só anthropic")
     g.add_argument("--anthropic-workspace-id", default=os.environ.get("ANTHROPIC_WORKSPACE_ID"),
                    help="workspace (wrkspc_...) para chave sem workspace; padrão: variável ANTHROPIC_WORKSPACE_ID")
-    g.add_argument("--llm-base-url", default=None, help="API compatível com OpenAI (ex.: http://localhost:11434/v1 para Ollama)")
+    g.add_argument("--llm-base-url", default=None,
+                   help="endereço do servidor (ollama: padrão http://localhost:11434; openai: ex. http://localhost:1234/v1 do LM Studio)")
+    g.add_argument("--llm-num-ctx", type=int, default=8192, help="janela de contexto pedida ao Ollama, em tokens (só ollama)")
     g.add_argument("--llm-cache", default="llm_cache", help="diretório do cache de respostas (versionar no git)")
     g.add_argument("--llm-offline", action="store_true", help="usa só o cache; falha se faltar alguma resposta")
-    g.add_argument("--llm-workers", type=int, default=8, help="requisições em paralelo")
+    g.add_argument("--llm-workers", type=int, default=None, help="requisições em paralelo (padrão: 2 com ollama, 8 nos demais)")
     g.add_argument("--llm-window", type=int, default=20, help="turnos por requisição")
+    ap.add_argument("--docs", default=None,
+                    help="processa só estes documentos, separados por vírgula (ex.: 1998-themas); bom para um teste rápido")
     args = ap.parse_args(argv)
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
     for p in profiles:
@@ -219,14 +223,23 @@ def main(argv=None):
     realizer_options = None
     if args.realizer == "llm":
         provider = make_provider(args.llm_provider, args.llm_model, args.llm_effort, args.llm_base_url,
-                                 args.anthropic_workspace_id)
+                                 args.anthropic_workspace_id, num_ctx=args.llm_num_ctx)
+        if not args.llm_offline and hasattr(provider, "check"):
+            provider.check()  # servidor fora do ar ou modelo ausente param aqui, antes de gerar qualquer coisa
+        workers = args.llm_workers or (2 if args.llm_provider == "ollama" else 8)
         realizer_options = {"provider": provider, "cache_dir": args.llm_cache, "offline": args.llm_offline,
-                            "workers": args.llm_workers, "window": args.llm_window}
+                            "workers": workers, "window": args.llm_window}
 
     out = Path(args.out)
     files = sorted(Path(args.xml_dir).glob("*.xml"))
     if not files:
         sys.exit(f"Nenhum XML encontrado em {args.xml_dir}")
+    if args.docs:
+        wanted = {d.strip() for d in args.docs.split(",") if d.strip()}
+        known = {slugify(f.name) for f in files}
+        if wanted - known:
+            sys.exit(f"documento desconhecido: {', '.join(sorted(wanted - known))} (opções: {', '.join(sorted(known))})")
+        files = [f for f in files if slugify(f.name) in wanted]
     rows = []
     for f in files:
         row = process(f, out, args.seed, args.support_threshold, args.dialogue_cap, args.noise, profiles, args.realizer,
@@ -255,9 +268,12 @@ def main(argv=None):
     (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n{len(rows)} documentos -> {out.resolve()}")
     for v, c in REALIZER_TOTALS.items():
-        acc = c.get("llm_accepted", 0)
-        print(f"{v}: {acc}/{c.get('turns', 0)} falas do LLM aceitas; "
+        acc, turns = c.get("llm_accepted", 0), c.get("turns", 0)
+        print(f"{v}: {acc}/{turns} falas do LLM aceitas; "
               + ", ".join(f"{k} {n}" for k, n in sorted(c.items()) if k.startswith(("fallback:", "request_failed:"))))
+        if args.llm_provider != "dry" and turns and acc < 0.5 * turns:
+            print(f"  aviso: menos da metade das falas de {v} veio do LLM; o resto é texto da variante A. "
+                  "Veja os motivos acima (modelo pequeno demais costuma dar lost_content/invented_number).")
     if realizer_options and hasattr(realizer_options["provider"], "estimate"):
         est = realizer_options["provider"].estimate()
         print(f"dry-run: {est['requests']} requisições, ~{est['input_tokens']:,} tokens de entrada e "

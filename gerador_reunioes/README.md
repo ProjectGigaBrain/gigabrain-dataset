@@ -19,9 +19,10 @@ ver o [README de lá](../README.md)). Esta pasta contém o código que os gera.
 O diagnóstico completo, com decisões e números, está em
 [RELATORIO_DIAGNOSTICO.md](RELATORIO_DIAGNOSTICO.md).
 
-**Requisitos:** Python ≥ 3.10, só biblioteca padrão. Os SDKs `anthropic` ou
-`openai` só são necessários para gerar a variante B com um LLM novo (ver
-[Variante B](#variante-b-falas-reescritas-por-llm)).
+**Requisitos:** Python ≥ 3.10, só biblioteca padrão (mais `pytest` para os
+testes). Gerar a variante B com um **LLM local** (Ollama, LM Studio...) também
+não exige instalar nada no Python. Só a API da Anthropic precisa do SDK
+(`pip install anthropic`). Ver [Variante B](#variante-b-falas-reescritas-por-llm).
 
 ---
 
@@ -280,21 +281,101 @@ plano em janelas de ~20 turnos. **As respostas já estão em cache** em
 python -m pureprep.cli --realizer llm --llm-offline
 ```
 
-Para gerar com um LLM novo (outro modelo, prompt alterado):
+Para as 3 variantes B (18 documentos × perfis `clean`, `realistic`, `hard`) são
+470 requisições, ~0,8 M tokens de entrada e ~0,35 M de saída. Cada requisição
+usa até ~4 mil tokens de entrada e ~2 mil de saída.
+
+#### Com um LLM local (Ollama): sem chave, sem custo, sem `pip install`
+
+1. **Instale o [Ollama](https://ollama.com/download)**. No Windows, use o
+   instalador ou `winget install Ollama.Ollama`. No Linux,
+   `curl -fsSL https://ollama.com/install.sh | sh`. Depois de instalado ele
+   fica rodando em segundo plano.
+2. **Baixe um modelo**. Qualquer modelo do [catálogo do Ollama](https://ollama.com/library)
+   serve. Prefira um modelo *instruct* de 12–14B parâmetros ou maior, de
+   **família diferente** da do sistema que será avaliado (RELATORIO §5.1). Os
+   comandos abaixo usam `gemma3:12b` só como exemplo:
+
+   ```bash
+   ollama pull gemma3:12b        # ou qwen3:14b, mistral-small, llama3.1:8b...
+   ```
+
+   > **Nos passos seguintes, troque `gemma3:12b` pelo nome exato do modelo que
+   > você baixou** (o mesmo do `ollama pull`; `ollama list` mostra os
+   > instalados). Se o nome não bater, o gerador avisa e para antes de começar.
+
+3. **Faça um teste rápido com um documento** (`output_*/` é ignorado pelo git):
+
+   ```bash
+   python -m pureprep.cli --realizer llm --llm-provider ollama --llm-model gemma3:12b --docs 1998-themas --out output_teste
+   ```
+
+   No fim, a saída mostra uma linha por variante como esta:
+
+   ```text
+   llm-realistic: 241/246 falas do LLM aceitas; fallback:invented_number 1, fallback:lost_content 4
+   ```
+
+   Se bem menos da metade das falas for aceita, o modelo é pequeno demais: as
+   falas recusadas ficam com o texto da variante A. O tempo desse teste vezes 18
+   dá uma ideia de quanto vai levar a geração completa.
+4. **Gere tudo e versione o cache** para que outras pessoas reproduzam sem rodar o modelo:
+
+   ```bash
+   python -m pureprep.cli --realizer llm --llm-provider ollama --llm-model gemma3:12b --out output_ollama
+   git add llm_cache && git commit -m "Cache da variante B (gemma3:12b)"
+   ```
+
+   As respostas ficam em `llm_cache/ollama-<modelo>/` (aqui,
+   `llm_cache/ollama-gemma3_12b/`), uma pasta por modelo, então dá para testar
+   vários sem um apagar o outro. Com o mesmo comando e
+   `--llm-offline`, a variante é reproduzida sem o Ollama. Se a geração for
+   interrompida, rode de novo: o que já está no cache não é pedido outra vez.
+
+O gerador já cuida dos ajustes que o Ollama exigiria. Ele pede 8 192 tokens de
+contexto (o padrão do Ollama cortaria o prompt sem avisar; mude com
+`--llm-num-ctx`), faz 2 requisições por vez (`--llm-workers`) e descarta o
+raciocínio de modelos como `qwen3` e `deepseek-r1`. Se o Ollama estiver fechado
+ou o modelo não tiver sido baixado, ele avisa e para antes de gerar qualquer
+coisa. Se todas as requisições de um documento falharem no meio da geração,
+ele também para, em vez de gravar uma "variante B" igual à A.
+
+O Ollama em outra máquina ou porta: `--llm-base-url http://servidor:11434`.
+
+#### Com outro servidor local (LM Studio, vLLM, llama.cpp) ou API compatível com OpenAI
+
+Use `--llm-provider openai` com o endereço da API do servidor. Também não
+precisa de `pip install`. A chave (`OPENAI_API_KEY`) só é exigida pela API da
+própria OpenAI.
 
 ```bash
+# LM Studio: carregue o modelo e ligue o servidor na aba Developer
+python -m pureprep.cli --realizer llm --llm-provider openai --llm-model <id do modelo> --llm-base-url http://localhost:1234/v1 --llm-workers 2
+```
+
+Nesse modo, o tamanho de contexto é configurado no próprio servidor. Deixe
+pelo menos 8 mil tokens.
+
+#### Com a API da Anthropic (padrão, usado na variante B publicada)
+
+```bash
+pip install anthropic
 # 1. orçar: não chama nada, só conta requisições e tokens
 python -m pureprep.cli --realizer llm --llm-provider dry
-# 2. gerar (precisa de ANTHROPIC_API_KEY; ou OPENAI_API_KEY com --llm-provider openai --llm-model ...)
+# 2. gerar (precisa de ANTHROPIC_API_KEY)
 python -m pureprep.cli --realizer llm
 # 3. versionar o cache para que outros reproduzam sem gastar
 git add llm_cache && git commit -m "Cache da variante B"
 ```
 
-Para as 3 variantes B (18 documentos × perfis `clean`, `realistic`, `hard`), o
-dry-run estimou 470 requisições, ~0,8 M tokens de entrada e ~0,35 M de saída.
+#### Publicar uma variante B gerada com outro modelo
 
-Garantias do realizador `llm`:
+As pastas se chamam `llm-<perfil>` qualquer que seja o modelo. Por isso,
+`python scripts/export_entradas.py --output output_ollama` **substitui** a
+variante B publicada em `../variante_B/`. O modelo usado fica registrado no
+`manifest.json` e em `generator.params.llm` de cada gabarito.
+
+#### Garantias do realizador `llm`
 
 - **O LLM nunca vê o detalhe escondido.** O prompt leva só o que o plano manda
   dizer; o valor removido por uma ambiguidade ou incompletude não chega ao modelo.
@@ -304,10 +385,9 @@ Garantias do realizador `llm`:
   ficam em `generator.realizer_stats` no gabarito.
 - **Mesmo ruído da A.** Hesitações ("uh", "um", palavras quebradas) são aplicadas
   depois, com a mesma semente. Um B sem nenhuma fala aceita é idêntico à A.
-- **Provedores:** `anthropic` (padrão `claude-opus-5-5`, `--llm-effort low`),
-  `openai` (ou qualquer API compatível via `--llm-base-url`, ex.: Ollama em
-  `http://localhost:11434/v1`) e `dry`. Prefira um modelo de **família diferente**
-  da do sistema avaliado (RELATORIO §5.1).
+- **Provedores:** `ollama` (LLM local), `openai` (qualquer API compatível),
+  `anthropic` (padrão `claude-opus-5-5`, `--llm-effort low`) e `dry`. Prefira
+  um modelo de **família diferente** da do sistema avaliado (RELATORIO §5.1).
 
 ---
 
@@ -325,13 +405,15 @@ Garantias do realizador `llm`:
 | `--support-threshold` | `0.6` | similaridade mínima para ligar um requisito a um trecho da entrada |
 | `--dialogue-cap` | `60` | máximo de requisitos sorteados por documento (≈ 1 h de reunião) |
 | `--noise` | `0.08` | taxa de ruído de fala (hesitações, palavras quebradas) |
-| `--llm-provider` | `anthropic` | `anthropic`, `openai` ou `dry` |
-| `--llm-model` | `claude-opus-5-5` | obrigatório com `openai` |
+| `--docs` | todos | só estes documentos, separados por vírgula (ex.: `1998-themas`) |
+| `--llm-provider` | `anthropic` | `ollama`, `openai`, `anthropic` ou `dry` |
+| `--llm-model` | `claude-opus-5-5` | obrigatório com `ollama` e `openai` |
 | `--llm-effort` | `low` | esforço de raciocínio (só `anthropic`) |
-| `--llm-base-url` | — | API compatível com OpenAI |
+| `--llm-base-url` | `http://localhost:11434` (`ollama`) | endereço do servidor (`ollama` ou `openai`) |
+| `--llm-num-ctx` | `8192` | contexto pedido ao Ollama, em tokens (só `ollama`) |
 | `--llm-cache` | `llm_cache` | pasta do cache de respostas |
 | `--llm-offline` | — | usa só o cache; falha se faltar resposta |
-| `--llm-workers` | `8` | requisições em paralelo |
+| `--llm-workers` | `2` (`ollama`), `8` (demais) | requisições em paralelo |
 | `--llm-window` | `20` | turnos por requisição |
 
 ### O que sai em `output/`
