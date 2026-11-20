@@ -1,9 +1,9 @@
 """Exporta variantes do modo ``meetings`` para o repositório de dados
-``EntradasGigabrain`` (pasta pai deste gerador) e regenera o índice.
+``gigabrain-dataset`` (pasta pai deste gerador) e regenera o índice.
 
 Layout gerado::
 
-    EntradasGigabrain/
+    gigabrain-dataset/
       indice_documentos.csv            # uma linha por (variante, documento)
       originais/<doc_id>.pdf           # documento original (compartilhado)
       variante_A/rules-<perfil>/...    # realizador por regras

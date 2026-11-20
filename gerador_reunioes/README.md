@@ -14,7 +14,7 @@ você entrega as transcrições ao sistema e compara o que ele extraiu com o gab
  └──────────────────┘                      (requisitos + conflitos, ambiguidades...)
 ```
 
-Os dados publicados ficam na pasta pai deste repositório (`EntradasGigabrain`,
+Os dados publicados ficam na pasta pai deste repositório (`gigabrain-dataset`,
 ver o [README de lá](../README.md)). Esta pasta contém o código que os gera.
 O diagnóstico completo, com decisões e números, está em
 [RELATORIO_DIAGNOSTICO.md](RELATORIO_DIAGNOSTICO.md).
@@ -254,7 +254,7 @@ gabarito (F1 = 1, valida o avaliador) e `naive` pega toda frase com "shall",
 python -m pureprep.baseline --pairs output/pairs/meetings/rules-realistic --kind naive --out preds/naive
 ```
 
-### Publicar no EntradasGigabrain
+### Publicar no gigabrain-dataset
 
 ```bash
 git commit ...                                   # o exportador exige o gerador commitado
