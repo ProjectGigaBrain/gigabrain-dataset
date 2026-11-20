@@ -39,7 +39,7 @@ O detalhamento por documento está em [`indice_documentos.csv`](indice_documento
 ## 2. Estrutura de diretórios
 
 ```text
-EntradasGigabrain/
+gigabrain-dataset/
 ├── README.md
 ├── indice_documentos.csv              # uma linha por (variante, documento), com a pasta de cada um
 ├── variante_A/                        # falas escritas por regras, sem LLM
